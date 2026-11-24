@@ -254,7 +254,7 @@ resolve_version() {
   log "Resolved latest version: ${RESOLVED_VERSION}"
 }
 
-# Download one release asset into DEST_DIR.
+# Download one release asset into DEST_DIR. Fails the install (die) on any HTTP error.
 # download_asset <name>
 download_asset() {
   local name="$1"
@@ -262,23 +262,27 @@ download_asset() {
   curl -fsSL -o "${DEST_DIR}/${name}" "$url" || die "download failed: ${name} (${url})"
 }
 
-# Verify SHA256SUMS digests for every file listed; optionally verify a detached signature.
-verify_checksums() {
-  local sums="${DEST_DIR}/SHA256SUMS"
-  [ -s "$sums" ] || die "SHA256SUMS missing from release v${RESOLVED_VERSION}"
-  (
-    cd "$DEST_DIR"
-    # Only verify files that were downloaded (ignore platform-specific rows we did not fetch).
-    while read -r hash file; do
-      [ -n "$hash" ] || continue
-      file="${file#\*}"
-      [ -f "$file" ] || continue
-      actual="$(sha256sum "$file" | awk '{print $1}')"
-      [ "$actual" = "$hash" ] || die "checksum mismatch for $file (expected $hash got $actual)"
-      ok "checksum $file"
-    done < SHA256SUMS
-  )
+# Print the SHA-256 that the (already signature-verified) SHA256SUMS lists for <name>, or nothing.
+# Accepts both "hash  name" and "hash *name" rows.
+sums_hash() { # sums_hash <name>
+  awk -v n="$1" '{ f = $2; sub(/^[*]/, "", f); if (f == n) { print $1; exit } }' "${DEST_DIR}/SHA256SUMS"
+}
 
+# Download <name> and check it against its SHA256SUMS row. A file that SHA256SUMS does not list is
+# refused: the signature only vouches for what is listed, so an unlisted file is unauthenticated.
+fetch_verified() { # fetch_verified <name>
+  local name="$1" want got
+  want="$(sums_hash "$name")"
+  [ -n "$want" ] || die "${name} is not listed in the signed SHA256SUMS of v${RESOLVED_VERSION} — refusing it"
+  download_asset "$name"
+  got="$(sha256sum "${DEST_DIR}/${name}" | awk '{print $1}')"
+  [ "$got" = "$want" ] || die "checksum mismatch for ${name} (expected ${want} got ${got})"
+  ok "checksum ${name}"
+}
+
+# Authenticate SHA256SUMS BEFORE any digest in it is trusted.
+verify_sums_signature() {
+  [ -s "${DEST_DIR}/SHA256SUMS" ] || die "SHA256SUMS missing from release v${RESOLVED_VERSION}"
   if [ "$HOKEKA_SKIP_SIGNATURE" = "1" ]; then
     warn "signature verification skipped (--insecure-skip-signature)"
     return 0
@@ -315,28 +319,35 @@ verify_signature() { # verify_signature <SHA256SUMS> <SHA256SUMS.asc>
   ok "SHA256SUMS signature verified against the pinned Hokeka release key"
 }
 
-# Fetch the release assets needed for this arch into DEST_DIR.
+# Fetch the release assets needed for this arch into DEST_DIR: signature over SHA256SUMS first,
+# then every artifact must be listed in it and match its digest.
 fetch_release() {
   DEST_DIR="$(mktemp -d /tmp/hokeka-edge.XXXXXX)"
   chmod 700 "$DEST_DIR"
   log "Downloading Edge v${RESOLVED_VERSION} from github.com/${HOKEKA_RELEASES_REPO}"
   download_asset "SHA256SUMS"
-  download_asset "SHA256SUMS.asc" 2>/dev/null || true
-  download_asset "SHA256SUMS.sig" 2>/dev/null || true
-  download_asset "edge-host.jar"
-  download_asset "install.sh"
+  if [ "$HOKEKA_SKIP_SIGNATURE" != "1" ]; then
+    download_asset "SHA256SUMS.asc"
+  fi
+  verify_sums_signature
+  fetch_verified "edge-host.jar"
+  fetch_verified "install.sh"
   # The offline inner installer runs compose up from its own directory and sizes
   # aerospike/aerospike.conf in place, so both ship as signed assets listed in SHA256SUMS.
-  download_asset "docker-compose.yml"
-  download_asset "aerospike.conf"
-  download_asset "install.ps1" 2>/dev/null || true
-  if [ "$LIBC" = "musl" ] && [ "$ARCH_KEY" = "x86_64" ]; then
-    download_asset "libedge_engine-linux-x86_64-musl.so" 2>/dev/null || true
-  else
-    download_asset "libedge_engine-linux-${ARCH_KEY}.so" 2>/dev/null || true
+  fetch_verified "docker-compose.yml"
+  fetch_verified "aerospike.conf"
+  # The native core is optional (the Edge falls back to the Java interpreter); fetch it only when
+  # this release lists one for the host.
+  local core="libedge_engine-linux-${ARCH_KEY}.so"
+  if [ "$LIBC" = "musl" ] && [ "$ARCH_KEY" = "x86_64" ] && [ "$HOKEKA_MODE" = "native" ]; then
+    core="libedge_engine-linux-x86_64-musl.so"
   fi
-  chmod +x "${DEST_DIR}/install.sh" 2>/dev/null || true
-  verify_checksums
+  if [ -n "$(sums_hash "$core")" ]; then
+    fetch_verified "$core"
+  else
+    warn "v${RESOLVED_VERSION} ships no ${core}; the Edge will use its Java interpreter"
+  fi
+  chmod +x "${DEST_DIR}/install.sh"
 }
 
 # ── redeem install token ─────────────────────────────────────────────────────────────────────────
