@@ -1,0 +1,51 @@
+Hokeka Edge — Client Distribution Terms
+=======================================
+
+Copyright (c) Hokeka. All rights reserved.
+
+This repository distributes pre-built Hokeka Edge Node binaries and install
+scripts for authorised Payment Service Provider (PSP) and bank customers.
+
+1. License grant
+   Subject to a valid commercial agreement with Hokeka (or an authorised
+   reseller), you may download, install, and run the Edge Node software on
+   systems you control for the purpose of evaluating payment transactions for
+   your organisation.
+
+2. Restrictions
+   You may not: (a) redistribute Edge binaries or install scripts except to
+   operators inside your organisation; (b) reverse engineer, decompile, or
+   attempt to extract source code except to the extent mandatory law allows;
+   (c) use the software to provide a competing hosted AML/fraud service;
+   (d) remove or obscure proprietary notices.
+
+3. No source code
+   Source code for Hokeka Edge and the Control Plane is not licensed under
+   this file and is not published in this repository.
+
+4. Data residency
+   Transaction data evaluated by an Edge Node remains on systems you control,
+   subject to the Hokeka Edge Data Residency Contract and your Console
+   configuration (retention, support access, cross-PSP opt-in).
+
+5. Warranty disclaimer
+   THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+6. Limitation of liability
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, HOKEKA SHALL NOT BE LIABLE FOR ANY
+   INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR ANY
+   LOSS OF PROFITS OR DATA, ARISING FROM USE OF THE SOFTWARE.
+
+7. Termination
+   Your rights under this file end automatically if you breach these terms or
+   when your commercial agreement with Hokeka ends. On termination you must
+   stop using the software and delete copies you control, except records you
+   are legally required to retain.
+
+8. Governing terms
+   If your signed agreement with Hokeka conflicts with this file, the signed
+   agreement controls.
+
+For support, contact your Hokeka account team or use the Console Help menu.
