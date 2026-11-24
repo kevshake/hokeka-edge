@@ -26,10 +26,13 @@
 #   --container               Force container mode (the default of the release installer)
 #   --install-dir <dir>       Install root (default /opt/hokeka; must be absolute, not /)
 #   --skip-preflight         Skip outbound HTTPS / resource checks (not recommended)
-#   --insecure-skip-signature Skip detached signature verification (internal mirrors only). REQUIRED
-#                             while this bootstrap has no pinned release signing key: without a pinned
-#                             key and without this flag the install stops (fail-closed, as install.sh)
+#   --insecure-skip-signature Skip detached signature verification (internal mirrors only; never needed
+#                             for the official releases, which are signed by the key pinned in this script)
 #   -h | --help               Show this help
+#
+# Outbound HTTPS needed: the Control Plane (aml.hokeka.com), api.github.com, github.com and its
+# release-asset CDN (release-assets.githubusercontent.com / objects.githubusercontent.com), plus
+# Docker Hub for the container images. HOKEKA_RELEASES_REPO overrides the release repo (forks).
 #
 set -euo pipefail
 
