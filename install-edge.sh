@@ -708,6 +708,16 @@ env_value() { # env_value <file> <KEY>
   sed -n "s/^$2=//p" "$1" | head -1
 }
 
+# The verdict in a POST /edge/evaluate response, read from stdin. The Edge answers
+# {"action":"HOLD","score":…}; "decision" is kept as a fallback for older builds (G16).
+edge_verdict() {
+  local body v
+  body="$(cat)"
+  v="$(printf '%s' "$body" | sed -n 's/.*"action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$v" ] || v="$(printf '%s' "$body" | sed -n 's/.*"decision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  printf '%s' "$v"
+}
+
 # ── post-install self-test (G8) ──────────────────────────────────────────────────────────────────
 # Three checks against the Edge's own transaction API, each printed in a PASS/FAIL summary:
 #   1. the API answers GET /edge/status over TLS,
@@ -748,7 +758,7 @@ run_self_test() {
       decision="$(curl -kfsS --connect-timeout 5 --max-time 30 -X POST "${base}/edge/evaluate" \
           -H "Content-Type: application/json" \
           -d "{\"txn_id\":\"selftest-$(date +%s)\",\"amount\":\"100\",\"currency\":\"KES\"}" 2>/dev/null \
-        | sed -n 's/.*"decision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')" || true
+        | edge_verdict)" || true
       if [ -n "$decision" ]; then
         r_eval="PASS"; d_eval="PAN-free test evaluation answered ${decision}"
       else
