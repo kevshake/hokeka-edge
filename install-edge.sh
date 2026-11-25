@@ -17,15 +17,22 @@
 #   --enrol-token <token>     Required for first install (unless --upgrade/--uninstall)
 #   --control-plane <url>     Default https://aml.hokeka.com
 #   --version <semver>        Pin a release (default: latest)
-#   --upgrade                 Re-download and reinstall the same or newer version
-#   --uninstall               Stop services and remove /opt/hokeka (keeps ledger data unless --purge)
-#   --purge                   With --uninstall, also remove data volumes
+#   --upgrade                 Reinstall the latest (or --version) release on an enrolled node; reuses
+#                             etc/bootstrap.env, but --control-plane/--edgeid/--native/--container win
+#   --uninstall               Stop the Edge (compose down / systemd) and remove its program files;
+#                             keeps config, secrets, identity and ledger data unless --purge
+#   --purge                   With --uninstall, also remove data, secrets and the ledger volume.
+#                             Asks you to type DELETE first (read from the terminal, also when piped)
+#   --yes                     With --uninstall --purge, skip that question (unattended removal)
+#   --self-test               Only run the post-install self-test against the existing install
+#   --no-self-test            Do not run the self-test at the end of install / upgrade
 #   --edgeid <id>             Optional preferred edge id
 #   --display-name <name>     Optional display name hint for redeem
 #   --native                  Prefer native JVM install (default: container when Docker available)
 #   --container               Force container mode (the default of the release installer)
 #   --install-dir <dir>       Install root (default /opt/hokeka; must be absolute, not /)
-#   --skip-preflight         Skip outbound HTTPS / resource checks (not recommended)
+#   --skip-preflight          Skip the outbound HTTPS, clock, Docker/compose version and resource
+#                             checks (not recommended)
 #   --insecure-skip-signature Skip detached signature verification (internal mirrors only; never needed
 #                             for the official releases, which are signed by the key pinned in this script)
 #   -h | --help               Show this help
@@ -37,6 +44,11 @@
 set -euo pipefail
 
 # ── defaults ─────────────────────────────────────────────────────────────────────────────────────
+# What the operator chose explicitly (environment or flags). On --upgrade these win over the values
+# saved in etc/bootstrap.env; anything not chosen explicitly comes from that saved file.
+EXPLICIT_RELEASES_REPO="${HOKEKA_RELEASES_REPO:-}"
+EXPLICIT_CONTROL_PLANE="${HOKEKA_CONTROL_PLANE:-}"
+EXPLICIT_EDGE_ID=""
 HOKEKA_RELEASES_REPO="${HOKEKA_RELEASES_REPO:-kevshake/hokeka-edge}"
 HOKEKA_CONTROL_PLANE="${HOKEKA_CONTROL_PLANE:-https://aml.hokeka.com}"
 HOKEKA_INSTALL_DIR="${HOKEKA_INSTALL_DIR:-/opt/hokeka}"
@@ -45,12 +57,29 @@ HOKEKA_ENROL_TOKEN=""
 HOKEKA_EDGE_ID=""
 HOKEKA_DISPLAY_NAME=""
 HOKEKA_MODE="auto"          # auto | native | container
-HOKEKA_ACTION="install"     # install | upgrade | uninstall
+HOKEKA_ACTION="install"     # install | upgrade | uninstall | selftest
 HOKEKA_PURGE=0
+HOKEKA_ASSUME_YES=0
+HOKEKA_SELF_TEST=1
 HOKEKA_SKIP_PREFLIGHT=0
 HOKEKA_SKIP_SIGNATURE=0
 HOKEKA_MIN_RAM_MB=2048
 HOKEKA_MIN_DISK_MB=10240
+# Preflight floors (G9). Docker 20.10 is the first engine with the compose v2 plugin; the release
+# installer drives the stack with "docker compose" / "podman compose", and the shipped
+# docker-compose.yml uses depends_on.required (optional ledger dependency), which needs Compose 2.20.
+HOKEKA_MIN_DOCKER="20.10"
+HOKEKA_MIN_COMPOSE="2.20"
+HOKEKA_MIN_PODMAN="4.7"
+# Largest tolerated clock offset from the Control Plane, in seconds. Install tokens, enrolment codes
+# and the mTLS client certificate are all time-bound, so a skewed clock fails enrolment opaquely.
+HOKEKA_MAX_CLOCK_SKEW="${HOKEKA_MAX_CLOCK_SKEW:-60}"
+# Post-install self-test (G8): how long to wait for the Control Plane to authorize the node.
+HOKEKA_SELF_TEST_TIMEOUT="${HOKEKA_SELF_TEST_TIMEOUT:-180}"
+HOKEKA_SELF_TEST_INTERVAL="${HOKEKA_SELF_TEST_INTERVAL:-15}"
+# Where --purge reads its confirmation from. /dev/tty, so it still asks when the script is piped
+# into bash (stdin is then the script itself).
+HOKEKA_CONFIRM_TTY="${HOKEKA_CONFIRM_TTY:-/dev/tty}"
 
 # ── pinned release signing key ───────────────────────────────────────────────────────────────────
 # The same trust anchor as edge-host/deploy/install.sh: SHA256SUMS.asc must be signed by this key.
@@ -87,8 +116,8 @@ usage() {
     printf '%s\n' "Hokeka Edge public bootstrap installer" \
       "Usage: install-edge.sh --enrol-token <token> [--control-plane <url>] [--version <semver>]" \
       "       [--edgeid <id>] [--display-name <name>] [--native|--container] [--install-dir <dir>]" \
-      "       [--skip-preflight] [--insecure-skip-signature]" \
-      "       install-edge.sh --upgrade [--version <semver>] | --uninstall [--purge]"
+      "       [--skip-preflight] [--insecure-skip-signature] [--no-self-test]" \
+      "       install-edge.sh --upgrade [--version <semver>] | --uninstall [--purge [--yes]] | --self-test"
   fi
   exit 0
 }
@@ -99,15 +128,18 @@ parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --enrol-token|--enroll-token) HOKEKA_ENROL_TOKEN="${2:-}"; shift 2 ;;
-      --control-plane) HOKEKA_CONTROL_PLANE="${2:-}"; shift 2 ;;
+      --control-plane) HOKEKA_CONTROL_PLANE="${2:-}"; EXPLICIT_CONTROL_PLANE="${2:-}"; shift 2 ;;
       --version) HOKEKA_VERSION="${2:-}"; shift 2 ;;
-      --edgeid|--edge-id) HOKEKA_EDGE_ID="${2:-}"; shift 2 ;;
+      --edgeid|--edge-id) HOKEKA_EDGE_ID="${2:-}"; EXPLICIT_EDGE_ID="${2:-}"; shift 2 ;;
       --display-name) HOKEKA_DISPLAY_NAME="${2:-}"; shift 2 ;;
       --native) HOKEKA_MODE="native"; shift ;;
       --container) HOKEKA_MODE="container"; shift ;;
       --upgrade) HOKEKA_ACTION="upgrade"; shift ;;
       --uninstall) HOKEKA_ACTION="uninstall"; shift ;;
       --purge) HOKEKA_PURGE=1; shift ;;
+      --yes|-y) HOKEKA_ASSUME_YES=1; shift ;;
+      --self-test) HOKEKA_ACTION="selftest"; shift ;;
+      --no-self-test) HOKEKA_SELF_TEST=0; shift ;;
       --skip-preflight) HOKEKA_SKIP_PREFLIGHT=1; shift ;;
       --insecure-skip-signature) HOKEKA_SKIP_SIGNATURE=1; shift ;;
       --install-dir) HOKEKA_INSTALL_DIR="${2:-}"; shift 2 ;;
@@ -115,6 +147,11 @@ parse_args() {
       *) die "unknown option: $1 (use --help)" ;;
     esac
   done
+  # --purge / --yes only mean something to --uninstall; silently ignoring them elsewhere could hide
+  # a mistyped command line.
+  if [ "$HOKEKA_ACTION" != "uninstall" ] && { [ "$HOKEKA_PURGE" = "1" ] || [ "$HOKEKA_ASSUME_YES" = "1" ]; }; then
+    die "--purge and --yes only apply to --uninstall"
+  fi
   # Uninstall runs rm -rf under this path, so an empty or root value must never get through.
   case "$HOKEKA_INSTALL_DIR" in
     /*[!/]*) ;;
@@ -128,22 +165,27 @@ detect_platform() {
   [ "$(uname -s)" = "Linux" ] || die "This bootstrap supports Linux only. On Windows use install.ps1 from the release assets."
   ARCH="$(uname -m)"
   case "$ARCH" in
-    x86_64|amd64) ARCH_KEY="x86_64"; GH_ARCH="amd64" ;;
-    aarch64|arm64) ARCH_KEY="aarch64"; GH_ARCH="arm64" ;;
+    x86_64|amd64) ARCH_KEY="x86_64" ;;
+    aarch64|arm64) ARCH_KEY="aarch64" ;;
     *) die "unsupported architecture: $ARCH (need amd64 or arm64)" ;;
   esac
 
   DISTRO="unknown"; PKG=""; LIBC="glibc"
   if [ -r /etc/os-release ]; then
+    # Read ID in a subshell so os-release (VERSION, NAME, ...) never overwrites this script's variables.
     # shellcheck disable=SC1091
-    . /etc/os-release
-    DISTRO="${ID:-unknown}"
+    DISTRO="$(. /etc/os-release && printf '%s' "${ID:-unknown}")"
   fi
   for m in apt-get dnf yum zypper apk; do
     if command -v "$m" >/dev/null 2>&1; then PKG="$m"; break; fi
   done
   if ldd --version 2>&1 | head -1 | grep -qi musl; then LIBC="musl"; fi
   log "Detected ${DISTRO} · ${ARCH_KEY} · ${LIBC} · pkg=${PKG:-none}"
+  # The musl native core is published for x86_64 only, and the release installer refuses --native on
+  # musl/arm64 — but only after the token is redeemed. Refuse it here instead.
+  if [ "$HOKEKA_MODE" = "native" ] && [ "$LIBC" = "musl" ] && [ "$ARCH_KEY" != "x86_64" ]; then
+    die "--native is not supported on musl with ${ARCH_KEY} (no native core is published for it). Use container mode (drop --native) — the token has NOT been used."
+  fi
 }
 
 # Require root (systemd + package installs).
@@ -236,6 +278,103 @@ preflight() {
       *) ok "SELinux: ${selinux:-unknown}" ;;
     esac
   fi
+
+  check_clock_skew
+  check_container_versions
+}
+
+# True when dotted version $1 >= $2, comparing numeric fields left to right ("24.0.7" >= "20.10").
+# Anything after the leading digits/dots ("26.1.3-1.el9", "v2.24.5") is ignored.
+version_ge() { # version_ge <have> <need>
+  local have need i h n
+  have="$(printf '%s' "$1" | sed -E 's/^[^0-9]*//; s/[^0-9.].*$//')"
+  need="$(printf '%s' "$2" | sed -E 's/^[^0-9]*//; s/[^0-9.].*$//')"
+  [ -n "$have" ] || return 1
+  local IFS=.
+  # shellcheck disable=SC2206
+  local ha=($have) na=($need)
+  for ((i = 0; i < ${#na[@]} || i < ${#ha[@]}; i++)); do
+    h="${ha[i]:-0}"; n="${na[i]:-0}"
+    h="$((10#${h:-0}))"; n="$((10#${n:-0}))"
+    [ "$h" -gt "$n" ] && return 0
+    [ "$h" -lt "$n" ] && return 1
+  done
+  return 0
+}
+
+# Convert an HTTP Date header (RFC 1123, always GMT) to epoch seconds with GNU or BusyBox date.
+http_date_epoch() { # http_date_epoch "<Tue, 25 Nov 2026 10:00:00 GMT>"
+  date -u -d "$1" +%s 2>/dev/null \
+    || date -u -D '%a, %d %b %Y %H:%M:%S GMT' -d "$1" +%s 2>/dev/null
+}
+
+# G9: the clock must agree with the Control Plane. The offset is measured against the Date header
+# of the Control Plane's own HTTPS answer, so it holds whichever NTP daemon (or none) the host runs.
+# A measured offset above HOKEKA_MAX_CLOCK_SKEW stops the install here, before the single-use token
+# is redeemed. When no Date header can be read, the host's NTP state is reported instead.
+check_clock_skew() {
+  local hdr server now skew ntp=""
+  hdr="$(curl -sS -o /dev/null -D - --connect-timeout 10 --max-time 30 \
+      "${HOKEKA_CONTROL_PLANE%/}/api/v1/actuator/health" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^[Dd][Aa][Tt][Ee]:[[:space:]]*//p' | head -1)" || true
+  if command -v timedatectl >/dev/null 2>&1; then
+    ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  fi
+  if [ -n "$hdr" ] && server="$(http_date_epoch "$hdr")" && [ -n "$server" ]; then
+    now="$(date -u +%s)"
+    skew=$((now - server)); [ "$skew" -lt 0 ] && skew=$((-skew))
+    if [ "$skew" -gt "$HOKEKA_MAX_CLOCK_SKEW" ]; then
+      die "the system clock is ${skew}s away from the Control Plane (limit ${HOKEKA_MAX_CLOCK_SKEW}s; host $(date -u '+%Y-%m-%dT%H:%M:%SZ'), Control Plane ${hdr}).
+       Install tokens, enrolment codes and the Edge's mTLS certificate are time-bound, so enrolment
+       would fail. Turn on time sync and re-run — the token has NOT been used:
+           timedatectl set-ntp true        # systemd-timesyncd
+           chronyc makestep                # chrony"
+    fi
+    ok "Clock within ${skew}s of the Control Plane (limit ${HOKEKA_MAX_CLOCK_SKEW}s)"
+  elif [ "$ntp" = "yes" ]; then
+    ok "Clock: NTP synchronized (could not read the Control Plane time to measure the offset)"
+  else
+    warn "Could not measure the clock offset from the Control Plane${ntp:+ and timedatectl reports NTPSynchronized=${ntp}}. Make sure NTP/chrony keeps this host's time — enrolment and mTLS depend on it."
+  fi
+}
+
+# G9: container mode needs an engine and compose new enough for the release's docker-compose.yml.
+# The release installer prefers docker over podman and drives "docker compose" (the v2 plugin), so
+# the checks follow the same order. With no engine at all the release installer installs the
+# current Docker itself, so that is reported rather than refused. Native mode needs neither.
+check_container_versions() {
+  [ "$HOKEKA_MODE" = "native" ] && return 0
+  local v engine
+  # podman-docker installs a "docker" command that is really podman; judge it by podman's floor.
+  if command -v docker >/dev/null 2>&1 && ! docker --version 2>/dev/null | grep -qi podman; then
+    engine="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+    [ -n "$engine" ] || engine="$(docker version --format '{{.Client.Version}}' 2>/dev/null || true)"
+    version_ge "$engine" "$HOKEKA_MIN_DOCKER" \
+      || die "Docker ${engine:-of unknown version} is older than the required ${HOKEKA_MIN_DOCKER}. Upgrade Docker (https://docs.docker.com/engine/install/) or re-run with --native — the token has NOT been used."
+    v="$(docker compose version --short 2>/dev/null || true)"
+    [ -n "$v" ] || die "Docker is installed but the compose v2 plugin is not ('docker compose version' fails). Install docker-compose-plugin (the standalone docker-compose v1 is not supported) or re-run with --native — the token has NOT been used."
+    version_ge "$v" "$HOKEKA_MIN_COMPOSE" \
+      || die "Docker Compose ${v} is older than the required ${HOKEKA_MIN_COMPOSE}. Upgrade docker-compose-plugin or re-run with --native — the token has NOT been used."
+    ok "Docker ${engine} · Compose ${v}"
+  elif command -v podman >/dev/null 2>&1; then
+    v="$(podman version --format '{{.Client.Version}}' 2>/dev/null || true)"
+    version_ge "$v" "$HOKEKA_MIN_PODMAN" \
+      || die "Podman ${v:-of unknown version} is older than the required ${HOKEKA_MIN_PODMAN} (needed for 'podman compose'). Upgrade podman, install Docker, or re-run with --native — the token has NOT been used."
+    podman compose version >/dev/null 2>&1 \
+      || die "'podman compose' is not available (install podman-compose or docker-compose for it to call), or re-run with --native — the token has NOT been used."
+    ok "Podman ${v} with podman compose"
+  else
+    ok "No container engine yet — the release installer installs the current Docker Engine + compose plugin"
+  fi
+  # The images (Aerospike, PostgreSQL, the Temurin base of the Edge image) come from Docker Hub on
+  # first start. The release installer probes it too, but only after the token is redeemed, so a
+  # blocked registry is caught here instead. 401 is Docker Hub's normal "auth required" answer.
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 "https://registry-1.docker.io/v2/" || true)"
+  case "$code" in
+    200|401) ok "Docker Hub reachable (registry-1.docker.io)" ;;
+    *) die "cannot reach Docker Hub at registry-1.docker.io (HTTP ${code:-none}). The Edge's container images are pulled from there: allow outbound HTTPS to registry-1.docker.io, auth.docker.io and production.cloudflare.docker.com (or set HTTPS_PROXY), or re-run with --native — the token has NOT been used." ;;
+  esac
 }
 
 # ── release download ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +461,7 @@ verify_signature() { # verify_signature <SHA256SUMS> <SHA256SUMS.asc>
 # Fetch the release assets needed for this arch into DEST_DIR: signature over SHA256SUMS first,
 # then every artifact must be listed in it and match its digest.
 fetch_release() {
-  DEST_DIR="$(mktemp -d /tmp/hokeka-edge.XXXXXX)"
+  DEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hokeka-edge.XXXXXX")"
   chmod 700 "$DEST_DIR"
   log "Downloading Edge v${RESOLVED_VERSION} from github.com/${HOKEKA_RELEASES_REPO}"
   download_asset "SHA256SUMS"
@@ -330,6 +469,7 @@ fetch_release() {
     download_asset "SHA256SUMS.asc"
   fi
   verify_sums_signature
+  verify_sums_version
   fetch_verified "edge-host.jar"
   fetch_verified "install.sh"
   # The offline inner installer runs compose up from its own directory and sizes
@@ -347,7 +487,35 @@ fetch_release() {
   else
     warn "v${RESOLVED_VERSION} ships no ${core}; the Edge will use its Java interpreter"
   fi
+  # Native mode installs Aerospike CE from the per-distro tarball named (with its SHA-256) in the
+  # release's aerospike-artifacts.json; the offline inner installer reads it from its directory.
+  if [ "$HOKEKA_MODE" = "native" ]; then
+    if [ -n "$(sums_hash "aerospike-artifacts.json")" ]; then
+      fetch_verified "aerospike-artifacts.json"
+    else
+      # Without the manifest the release installer can only install a verified Aerospike from
+      # AERO_PACKAGE_URL + AERO_PACKAGE_SHA256; refuse now rather than after the token is redeemed.
+      [ -n "${AERO_PACKAGE_URL:-}" ] && [ -n "${AERO_PACKAGE_SHA256:-}" ]         || die "v${RESOLVED_VERSION} lists no aerospike-artifacts.json, so native mode cannot install a verified Aerospike. Export AERO_PACKAGE_URL and AERO_PACKAGE_SHA256 (an Aerospike CE tarball and its SHA-256), or use container mode — the token has NOT been used."
+      warn "v${RESOLVED_VERSION} lists no aerospike-artifacts.json; using AERO_PACKAGE_URL with AERO_PACKAGE_SHA256"
+    fi
+  fi
   chmod +x "${DEST_DIR}/install.sh"
+}
+
+# The release tooling (scripts/write-release-sha256sums.sh) writes "# version: v<version>" inside the
+# signed SHA256SUMS, binding the signature to one release. Refuse a manifest that names another
+# version: that is an older signed release served under this tag. Releases cut before the line
+# existed have none and are accepted with a warning.
+verify_sums_version() {
+  local named
+  named="$(sed -n 's/^# version:[[:space:]]*v\{0,1\}\([^[:space:]]*\).*/\1/p' "${DEST_DIR}/SHA256SUMS" | head -1)"
+  if [ -z "$named" ]; then
+    warn "SHA256SUMS of v${RESOLVED_VERSION} has no version line — its signature is not bound to a version"
+    return 0
+  fi
+  [ "$named" = "$RESOLVED_VERSION" ] \
+    || die "SHA256SUMS is signed for v${named}, not the requested v${RESOLVED_VERSION} — refusing it (replayed or mislabelled release)"
+  ok "SHA256SUMS is bound to v${named}"
 }
 
 # ── redeem install token ─────────────────────────────────────────────────────────────────────────
@@ -409,11 +577,18 @@ run_inner_install() {
   cp -f "${DEST_DIR}/install.sh" "$staging/install.sh"
   chmod +x "$staging/install.sh"
   cp -f "${DEST_DIR}/edge-host.jar" "$staging/edge-host.jar"
-  cp -f "${DEST_DIR}/SHA256SUMS" "$staging/SHA256SUMS" 2>/dev/null || true
+  # The signature-verified SHA256SUMS: the inner installer checks aerospike-artifacts.json against it.
+  cp -f "${DEST_DIR}/SHA256SUMS" "$staging/SHA256SUMS"
   cp -f "${DEST_DIR}/docker-compose.yml" "$staging/docker-compose.yml"
   mkdir -p "$staging/aerospike"
   cp -f "${DEST_DIR}/aerospike.conf" "$staging/aerospike/aerospike.conf"
-  # Normalise the native library name the offline installer looks for (libedge_engine*.so).
+  rm -f "$staging/aerospike-artifacts.json"
+  if [ -s "${DEST_DIR}/aerospike-artifacts.json" ]; then
+    cp -f "${DEST_DIR}/aerospike-artifacts.json" "$staging/aerospike-artifacts.json"
+  fi
+  # Only this release's core may sit beside the inner installer: a core left by an earlier install
+  # (other libc, older version) would otherwise be picked up instead.
+  rm -f "$staging"/libedge_engine*.so
   local lib
   for lib in "${DEST_DIR}"/libedge_engine*.so; do
     [ -f "$lib" ] || continue
@@ -429,6 +604,7 @@ run_inner_install() {
     --edgeid "$HOKEKA_EDGE_ID"
     --controlplane "$HOKEKA_CONTROL_PLANE"
     --version "$RESOLVED_VERSION"
+    --data-dir "$HOKEKA_INSTALL_DIR"
     --offline
   )
   if [ -n "$REDEEM_ENROLL_CODE" ]; then
@@ -441,53 +617,265 @@ run_inner_install() {
   # checksums); the inner
   # installer runs offline on those same files, so it does not verify them a second time.
   args+=(--insecure-skip-signature)
+  # The bootstrap runs the self-test itself once bootstrap.env is saved (run_self_test below), so a
+  # failing self-test never leaves a node that --upgrade / --self-test can no longer find.
+  args+=(--no-self-test)
 
-  log "Running release installer (offline) from ${staging}"
-  (
-    cd "$staging"
-    bash ./install.sh "${args[@]}"
-  )
-
+  # Save the enrolment (PSP id, edge id, enrolment code) BEFORE the release installer runs: the
+  # token is already redeemed, so if that installer fails (image pull, compose up, a full disk) the
+  # operator recovers with --upgrade, which reuses this file, instead of needing a new token.
   mkdir -p "${HOKEKA_INSTALL_DIR}/etc"
-  cat > "${HOKEKA_INSTALL_DIR}/etc/bootstrap.env" <<EOF
+  local installed_mode="container"
+  [ "$HOKEKA_MODE" = "native" ] && installed_mode="native"
+  cat > "${HOKEKA_INSTALL_DIR}/etc/bootstrap.env" <<ENV
 HOKEKA_CONTROL_PLANE=${HOKEKA_CONTROL_PLANE}
 HOKEKA_RELEASES_REPO=${HOKEKA_RELEASES_REPO}
 HOKEKA_VERSION=${RESOLVED_VERSION}
+HOKEKA_MODE=${installed_mode}
 HOKEKA_PSP_ID=${REDEEM_PSP_ID}
 HOKEKA_EDGE_ID=${HOKEKA_EDGE_ID}
 HOKEKA_ENROLL_CODE=${REDEEM_ENROLL_CODE}
-EOF
+ENV
   chmod 600 "${HOKEKA_INSTALL_DIR}/etc/bootstrap.env"
-  ok "Edge installed (v${RESOLVED_VERSION})"
+
+  log "Running release installer (offline) from ${staging}"
+  if ! ( cd "$staging" && bash ./install.sh "${args[@]}" ); then
+    die "the release installer failed (see its output above). The enrolment is saved in ${HOKEKA_INSTALL_DIR}/etc/bootstrap.env,
+       so no new token is needed: fix the cause, then re-run
+           curl -fsSL https://hokeka.com/install-edge.sh | sudo bash -s -- --upgrade --install-dir ${HOKEKA_INSTALL_DIR}"
+  fi
+  ok "Edge installed (v${RESOLVED_VERSION}, ${installed_mode} mode)"
 }
 
-# Reload previously saved bootstrap.env for upgrade paths.
+# Where install.sh keeps the Edge's environment (with EDGE_ENROLLMENT_CODE) for each mode:
+# container mode writes .env beside itself (release-staging), native mode writes
+# <data-dir>/config/edge.env, and the bootstrap passes --data-dir ${HOKEKA_INSTALL_DIR}.
+edge_env_file() { # edge_env_file container|native
+  if [ "$1" = "native" ]; then
+    printf '%s/config/edge.env' "$HOKEKA_INSTALL_DIR"
+  else
+    printf '%s/release-staging/.env' "$HOKEKA_INSTALL_DIR"
+  fi
+}
+
+# Reload the bootstrap.env saved at install time for the upgrade path. The file is parsed as
+# KEY=value lines, never sourced, and only fills what the operator did not choose: --control-plane,
+# --edgeid, --native/--container and an exported HOKEKA_RELEASES_REPO / HOKEKA_CONTROL_PLANE win.
+# The saved HOKEKA_VERSION is the INSTALLED version — it is reported, never used as the target, so
+# an upgrade without --version goes to the latest release and --version picks any other.
 load_bootstrap_env() {
+  local f="${HOKEKA_INSTALL_DIR}/etc/bootstrap.env" key value
+  local saved_cp="" saved_repo="" saved_mode="" saved_psp="" saved_edge="" saved_code=""
+  [ -s "$f" ] || die "no existing install at ${HOKEKA_INSTALL_DIR} (missing etc/bootstrap.env)"
+  INSTALLED_VERSION=""
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      HOKEKA_CONTROL_PLANE) saved_cp="$value" ;;
+      HOKEKA_RELEASES_REPO) saved_repo="$value" ;;
+      HOKEKA_VERSION) INSTALLED_VERSION="$value" ;;
+      HOKEKA_MODE) saved_mode="$value" ;;
+      HOKEKA_PSP_ID) saved_psp="$value" ;;
+      HOKEKA_EDGE_ID) saved_edge="$value" ;;
+      HOKEKA_ENROLL_CODE) saved_code="$value" ;;
+    esac
+  done < "$f"
+  [ -n "$saved_psp" ] || die "${f} has no HOKEKA_PSP_ID — cannot upgrade this install; reinstall with --enrol-token"
+  HOKEKA_CONTROL_PLANE="${EXPLICIT_CONTROL_PLANE:-${saved_cp:-$HOKEKA_CONTROL_PLANE}}"
+  HOKEKA_RELEASES_REPO="${EXPLICIT_RELEASES_REPO:-${saved_repo:-$HOKEKA_RELEASES_REPO}}"
+  HOKEKA_EDGE_ID="${EXPLICIT_EDGE_ID:-$saved_edge}"
+  if [ "$HOKEKA_MODE" = "auto" ]; then
+    case "$saved_mode" in native|container) HOKEKA_MODE="$saved_mode" ;; *) HOKEKA_MODE="container" ;; esac
+  fi
+  REDEEM_PSP_ID="$saved_psp"
+  REDEEM_ENROLL_CODE="$saved_code"
+  log "Upgrading ${HOKEKA_MODE} install (installed v${INSTALLED_VERSION:-unknown}) — Control Plane ${HOKEKA_CONTROL_PLANE}, releases ${HOKEKA_RELEASES_REPO}"
+}
+
+# The container engine's compose command, or nothing when no engine is installed.
+compose_cmd() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    printf 'docker compose'
+  elif command -v docker-compose >/dev/null 2>&1; then
+    printf 'docker-compose'
+  elif command -v podman >/dev/null 2>&1; then
+    printf 'podman compose'
+  fi
+}
+
+# Value of KEY in an env file written by install.sh, or nothing. Read as text, never sourced.
+env_value() { # env_value <file> <KEY>
+  [ -s "$1" ] || return 0
+  sed -n "s/^$2=//p" "$1" | head -1
+}
+
+# ── post-install self-test (G8) ──────────────────────────────────────────────────────────────────
+# Three checks against the Edge's own transaction API, each printed in a PASS/FAIL summary:
+#   1. the API answers GET /edge/status over TLS,
+#   2. the Control Plane has authorized the node (authorization=active) within the timeout,
+#   3. one PAN-free POST /edge/evaluate returns a decision (evaluate → decide → record works).
+# Runs after bootstrap.env is saved, so a failure leaves a complete install that can be inspected
+# and re-checked with --self-test. Returns non-zero when any check fails.
+run_self_test() {
+  local mode="${HOKEKA_MODE}" env_file bind port base i status_json="" authorization="" evaluator decision
+  [ "$mode" = "native" ] || mode="container"
+  env_file="$(edge_env_file "$mode")"
+  if [ "$mode" = "container" ]; then
+    bind="$(env_value "$env_file" EDGE_BIND)"; port="$(env_value "$env_file" EDGE_API_PORT)"
+  else
+    bind="$(env_value "$env_file" EDGE_BIND_ADDRESS)"
+  fi
+  # A wildcard bind is reachable on loopback; the API port defaults to 8443 in both modes.
+  case "${bind:-127.0.0.1}" in 0.0.0.0|::|"[::]") bind="127.0.0.1" ;; esac
+  base="https://${bind:-127.0.0.1}:${port:-8443}"
+  local r_api="FAIL" r_auth="SKIP" r_eval="SKIP" d_api="no answer from ${base}/edge/status" d_auth="" d_eval=""
+
+  log "Self-test: checking the Edge at ${base} (waiting up to ${HOKEKA_SELF_TEST_TIMEOUT}s for authorization)…"
+  local deadline=$(( $(date +%s) + HOKEKA_SELF_TEST_TIMEOUT ))
+  while :; do
+    if status_json="$(curl -kfsS --connect-timeout 5 --max-time 15 "${base}/edge/status" 2>/dev/null)"; then
+      r_api="PASS"; d_api="${base}/edge/status answers"
+      authorization="$(printf '%s' "$status_json" | sed -n 's/.*"authorization"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      [ "$authorization" = "active" ] && break
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep "$HOKEKA_SELF_TEST_INTERVAL"
+  done
+
+  if [ "$r_api" = "PASS" ]; then
+    if [ "$authorization" = "active" ]; then
+      evaluator="$(printf '%s' "$status_json" | sed -n 's/.*"evaluator"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      r_auth="PASS"; d_auth="authorized by the Control Plane${evaluator:+ (evaluator ${evaluator})}"
+      decision="$(curl -kfsS --connect-timeout 5 --max-time 30 -X POST "${base}/edge/evaluate" \
+          -H "Content-Type: application/json" \
+          -d "{\"txn_id\":\"selftest-$(date +%s)\",\"amount\":\"100\",\"currency\":\"KES\"}" 2>/dev/null \
+        | sed -n 's/.*"decision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')" || true
+      if [ -n "$decision" ]; then
+        r_eval="PASS"; d_eval="PAN-free test evaluation answered ${decision}"
+      else
+        r_eval="FAIL"; d_eval="POST /edge/evaluate returned no decision"
+      fi
+    else
+      r_auth="FAIL"; d_auth="not authorized after ${HOKEKA_SELF_TEST_TIMEOUT}s (authorization=${authorization:-none})"
+    fi
+  fi
+  [ -n "$d_auth" ] || d_auth="needs a reachable API"
+  [ -n "$d_eval" ] || d_eval="needs an authorized node"
+
+  echo
+  log "──────────── Self-test summary ────────────"
+  printf '  %-4s  %s\n' "$r_api" "Edge API: ${d_api}" "$r_auth" "Enrolment: ${d_auth}" "$r_eval" "Decision path: ${d_eval}"
+  if [ "$r_api" = "PASS" ] && [ "$r_auth" = "PASS" ] && [ "$r_eval" = "PASS" ]; then
+    ok "Self-test: PASS (3/3) — the Edge is enrolled and answering"
+    return 0
+  fi
+  printf '\033[0;31m[hokeka] Self-test: FAIL\033[0m — the Edge is installed but not yet healthy.\n' >&2
+  if [ "$mode" = "container" ]; then
+    echo "  Logs:    cd ${HOKEKA_INSTALL_DIR}/release-staging && docker compose logs edge   (podman compose on podman hosts)"
+  else
+    echo "  Logs:    journalctl -u hokeka-edge -n 100"
+  fi
+  echo "  Pending: check the node on Console → Edge Nodes; a node stays unauthorized until its enrolment code is accepted."
+  echo "  Re-run:  curl -fsSL https://hokeka.com/install-edge.sh | sudo bash -s -- --self-test --install-dir ${HOKEKA_INSTALL_DIR}"
+  return 1
+}
+
+# --self-test on an existing install: load the saved mode and run only the self-test.
+do_self_test() {
+  require_root
   local f="${HOKEKA_INSTALL_DIR}/etc/bootstrap.env"
   [ -s "$f" ] || die "no existing install at ${HOKEKA_INSTALL_DIR} (missing etc/bootstrap.env)"
-  # shellcheck disable=SC1090
-  . "$f"
-  HOKEKA_CONTROL_PLANE="${HOKEKA_CONTROL_PLANE}"
-  REDEEM_PSP_ID="${HOKEKA_PSP_ID}"
-  HOKEKA_EDGE_ID="${HOKEKA_EDGE_ID}"
-  REDEEM_ENROLL_CODE="${HOKEKA_ENROLL_CODE:-}"
+  if [ "$HOKEKA_MODE" = "auto" ]; then
+    case "$(env_value "$f" HOKEKA_MODE)" in native) HOKEKA_MODE="native" ;; *) HOKEKA_MODE="container" ;; esac
+  fi
+  run_self_test || exit 1
 }
 
-# Stop services and remove the install tree; optionally purge data.
+# Run the self-test at the end of install / upgrade unless --no-self-test; exit 1 when it fails.
+finish_with_self_test() {
+  if [ "$HOKEKA_SELF_TEST" = "1" ]; then
+    run_self_test || exit 1
+  else
+    warn "self-test skipped (--no-self-test); run it later with: curl -fsSL https://hokeka.com/install-edge.sh | sudo bash -s -- --self-test --install-dir ${HOKEKA_INSTALL_DIR}"
+  fi
+}
+
+# G5: --purge deletes the Edge Ledger (the PSP's multi-year system of record) and the node's
+# identity, so it is confirmed first: --yes, or DELETE typed on the terminal. With neither (no
+# terminal, e.g. an unattended run) nothing is deleted.
+confirm_purge() {
+  local answer=""
+  if [ "$HOKEKA_ASSUME_YES" = "1" ]; then
+    warn "--yes given: deleting the Edge Ledger, secrets and identity without asking"
+    return 0
+  fi
+  if ! { : < "$HOKEKA_CONFIRM_TTY"; } 2>/dev/null; then
+    die "--purge permanently deletes the Edge Ledger (every recorded evaluation — the PSP's system of record), the TLS/mTLS secrets and the node's enrolment identity under ${HOKEKA_INSTALL_DIR}.
+       There is no terminal to confirm on, so nothing was deleted. Back up the ledger first, then
+       re-run with --uninstall --purge --yes — or use --uninstall alone, which keeps all data."
+  fi
+  {
+    printf '\n\033[0;31m[hokeka] --purge permanently deletes, under %s:\033[0m\n' "$HOKEKA_INSTALL_DIR"
+    printf '  - the Edge Ledger (container volume ledger-data / data/): every recorded evaluation, the PSP'"'"'s system of record\n'
+    printf '  - the Aerospike feature store, TLS + mTLS keystores and their passwords\n'
+    printf '  - the enrolment identity: the node must be re-enrolled with a new install token\n'
+    printf 'Back up the ledger first. Type DELETE to continue, anything else to cancel: '
+  } >> "$HOKEKA_CONFIRM_TTY"
+  IFS= read -r answer < "$HOKEKA_CONFIRM_TTY" || true
+  [ "$answer" = "DELETE" ] || die "purge cancelled — nothing was deleted"
+}
+
+# Stop the Edge in whichever mode it runs, then remove the install. Without --purge only the
+# replaceable program files go: the configuration, secrets (TLS keystores, ledger password),
+# enrolment identity, ledger volume and bootstrap.env stay, so a later install or --upgrade resumes
+# the same node. With --purge the stack is torn down with its volumes BEFORE its directories go —
+# never deleting directories that running containers still have mounted.
 do_uninstall() {
   require_root
   log "Uninstalling Hokeka Edge from ${HOKEKA_INSTALL_DIR}"
-  systemctl stop hokeka-edge 2>/dev/null || true
-  systemctl disable hokeka-edge 2>/dev/null || true
-  rm -f /etc/systemd/system/hokeka-edge.service
-  systemctl daemon-reload 2>/dev/null || true
+  local staging="${HOKEKA_INSTALL_DIR}/release-staging" compose
+  # Ask before anything is stopped, so a cancelled purge leaves the Edge running and untouched.
+  [ "$HOKEKA_PURGE" = "1" ] && confirm_purge
+  # Container mode: compose services are restart: unless-stopped, so they must be brought down —
+  # stopping a systemd unit (there is none in this mode) would leave them running.
+  # The mode saved at install time decides; docker-compose.yml is staged in both modes, so its
+  # presence alone is not proof of a container install. Without bootstrap.env (an install made by
+  # install.sh directly), a staged .env written by the container path is the evidence.
+  local saved_mode
+  saved_mode="$(env_value "${HOKEKA_INSTALL_DIR}/etc/bootstrap.env" HOKEKA_MODE)"
+  if [ -s "$staging/docker-compose.yml" ] && { [ "$saved_mode" = "container" ]        || { [ -z "$saved_mode" ] && [ -s "$staging/.env" ]; }; }; then
+    compose="$(compose_cmd)"
+    [ -n "$compose" ] || die "the Edge was installed in container mode but no docker/podman compose is available to stop it — install it, or stop the hokeka containers by hand, then re-run"
+    if [ "$HOKEKA_PURGE" = "1" ]; then
+      ( cd "$staging" && $compose down --volumes --remove-orphans ) \
+        || die "'${compose} down --volumes' failed in ${staging} — nothing was deleted"
+      ok "Edge containers stopped and removed, with their volumes"
+    else
+      ( cd "$staging" && $compose down --remove-orphans ) \
+        || die "'${compose} down' failed in ${staging} — nothing was deleted"
+      ok "Edge containers stopped and removed (volumes kept)"
+    fi
+  fi
+  # Native mode: the systemd unit written by install.sh.
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop hokeka-edge 2>/dev/null || true
+    systemctl disable hokeka-edge 2>/dev/null || true
+    rm -f /etc/systemd/system/hokeka-edge.service
+    systemctl daemon-reload 2>/dev/null || true
+  fi
   if [ "$HOKEKA_PURGE" = "1" ]; then
+    local was_native=0
+    [ "$(env_value "${HOKEKA_INSTALL_DIR}/etc/bootstrap.env" HOKEKA_MODE)" = "native" ] && was_native=1
     rm -rf "$HOKEKA_INSTALL_DIR"
     ok "Removed ${HOKEKA_INSTALL_DIR} (purged)"
-  else
-    rm -rf "${HOKEKA_INSTALL_DIR}/release-staging" "${HOKEKA_INSTALL_DIR}/bin" 2>/dev/null || true
-    warn "Left data under ${HOKEKA_INSTALL_DIR}/data (use --purge to delete)"
+    # Native mode keeps its ledger in the host's PostgreSQL 16, which other software may share;
+    # the database is named so the operator can drop it deliberately.
+    [ "$was_native" = "1" ] && warn "Native mode: the ledger database 'hokeka_ledger' (role 'hokeka_edge') is still in the host PostgreSQL. After a backup, drop it with: sudo -u postgres psql -c 'DROP DATABASE hokeka_ledger' -c 'DROP ROLE hokeka_edge'"
+    return 0
   fi
+  rm -rf "${HOKEKA_INSTALL_DIR:?}/bin" "${HOKEKA_INSTALL_DIR:?}/lib"
+  rm -f "$staging/install.sh" "$staging/edge-host.jar" "$staging"/libedge_engine*.so
+  ok "Removed the Edge program files"
+  warn "Kept configuration, secrets, enrolment identity and ledger data under ${HOKEKA_INSTALL_DIR} (config/, secrets/, data/, etc/ and release-staging/{.env,config,secrets,data}) and the ledger volume — re-run with --uninstall --purge to delete them"
 }
 
 # Upgrade: re-fetch release and re-run install.sh offline without consuming a new token.
@@ -498,21 +886,22 @@ do_upgrade() {
   install_host_deps
   load_bootstrap_env
   # On upgrade the node is already enrolled: reuse the enrollment code saved at install time
-  # (HOKEKA_ENROLL_CODE in bootstrap.env) or the one in edge.env so a still-PENDING node can
-  # activate. Never invent a placeholder code — an ACTIVE node does not need one.
-  if [ -s "${HOKEKA_INSTALL_DIR}/edge.env" ]; then
-    existing_code="$(grep -E '^EDGE_ENROLLMENT_CODE=' "${HOKEKA_INSTALL_DIR}/edge.env" | head -1 | cut -d= -f2- || true)"
+  # (HOKEKA_ENROLL_CODE in bootstrap.env) or, when present, the one install.sh wrote into the
+  # Edge's own environment file, so a still-PENDING node can activate. Never invent a placeholder
+  # code — an ACTIVE node does not need one.
+  local env_file existing_code
+  env_file="$(edge_env_file "$HOKEKA_MODE")"
+  if [ -s "$env_file" ]; then
+    existing_code="$(grep -E '^EDGE_ENROLLMENT_CODE=' "$env_file" | head -1 | cut -d= -f2- || true)"
     [ -n "$existing_code" ] && REDEEM_ENROLL_CODE="$existing_code"
   fi
-  if [ -z "$HOKEKA_VERSION" ]; then
-    resolve_version
-  else
-    RESOLVED_VERSION="${HOKEKA_VERSION#v}"
-  fi
+  # Target: --version when given, else the latest release (never the saved installed version).
+  resolve_version
   preflight
   fetch_release
   run_inner_install
   ok "Upgrade to v${RESOLVED_VERSION} complete"
+  finish_with_self_test
 }
 
 # First-time install path: deps → preflight → download → redeem → install.
@@ -528,8 +917,9 @@ do_install() {
   fetch_release
   redeem_token
   run_inner_install
-  log "Next: watch the Edge Nodes page — the node should move to Active after enrolment completes."
   log "Docs: https://docs.hokeka.com/docs/06-edge-public-install"
+  finish_with_self_test
+  log "Next: the node shows as Active on Console → Edge Nodes."
 }
 
 # Entrypoint: dispatch install / upgrade / uninstall.
@@ -538,6 +928,7 @@ main() {
   case "$HOKEKA_ACTION" in
     uninstall) do_uninstall ;;
     upgrade) do_upgrade ;;
+    selftest) do_self_test ;;
     install) do_install ;;
     *) die "unknown action: $HOKEKA_ACTION" ;;
   esac
